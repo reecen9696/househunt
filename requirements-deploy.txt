@@ -1,0 +1,9 @@
+# Runtime dependencies for the hosted deployment.
+#
+# Deliberately smaller than requirements.txt: fetch.build_fetcher imports
+# each fetcher lazily, and the deployment runs fetch.fetcher: scrapedo, so
+# selenium and undetected-chromedriver are never imported and are left out.
+# Switching the hosted config to fetch.fetcher: chrome would need them back
+# plus a browser in the image.
+pyyaml>=6.0
+requests>=2.31

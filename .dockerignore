@@ -1,0 +1,11 @@
+data/
+secrets.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+docs/
+tests/
+chrome-extension/

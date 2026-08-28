@@ -1,0 +1,11 @@
+# Data, cache and logs — regenerated per run, never committed
+data/
+
+# Secrets and session material for fetchers
+secrets.env
+
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/

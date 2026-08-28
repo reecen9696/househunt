@@ -1,0 +1,9 @@
+pyyaml>=6.0
+requests>=2.31
+# Needed for the chrome fetcher (realestate.com.au bot protection).
+# Optional if you only ever run fetch.fetcher: requests or re-parse cache.
+undetected-chromedriver>=3.5
+selenium>=4.20
+setuptools>=69  # undetected-chromedriver imports distutils, removed in Py3.12+
+# Dev
+pytest>=8.0

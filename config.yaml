@@ -1,0 +1,358 @@
+# ============================================================================
+# Passed-In Property Finder — configuration
+#
+# Everything tunable lives here. If a scrape breaks, the fix should be an
+# edit to this file (selectors / JSON paths / label mappings), not to code.
+# Secrets (Browserless tokens etc.) go in secrets.env — never here.
+# ============================================================================
+
+run:
+  # Where the SQLite store, page cache and logs live. Relative to this file.
+  data_dir: ./data
+  db_file: passedin.sqlite
+  cache_subdir: cache          # raw fetched pages, by run date + URL hash
+  log_subdir: logs
+
+fetch:
+  # Which fetcher implementation to use, per the pluggable fetch interface.
+  #   scrapedo — proxied unblocker API; the only strategy observed to pass
+  #              realestate.com.au's Kasada protection (same approach the
+  #              propertypath-backend uses). Needs SCRAPE_DO_TOKEN in
+  #              secrets.env. Costs credits per request; the disk cache
+  #              keeps that to one paid fetch per page per week.
+  #   chrome   — local undetected-chromedriver. Verified 2026-08: Kasada
+  #              blocks it on realestate.com.au even headed/attended.
+  #              Kept for less-protected hosts and future sources.
+  #   requests — plain HTTP; fine for cached re-parses only.
+  fetcher: scrapedo
+  # Sequential requests with randomised delay drawn uniformly from this range.
+  # Keep this at human scale: well under one request per second sustained.
+  min_delay_seconds: 2.5
+  max_delay_seconds: 6.0
+  timeout_seconds: 90
+  scrapedo:
+    # Extra query params for api.scrape.do.
+    #   super         — residential/mobile proxies (required for REA)
+    #   render        — run the page's JS. NOT optional: without it REA
+    #                   requests fail with 502 ROTATION_FAILED after ~60s,
+    #                   which is scrape.do's own advice on that error. With
+    #                   it, the same request returns 200 in ~9s.
+    #   extraHeaders  — mirrors the propertypath-backend's proven call
+    #   geoCode       — pin the exit node to Australia
+    # realestate.com.au is priced per-domain at 25 credits regardless, so
+    # render costs nothing extra here.
+    params:
+      render: true
+      geoCode: au
+  chrome:
+    # Headed (false) is the reliable mode: REA's bot protection blocks
+    # headless Chrome outright (challenge page never resolves). A Chrome
+    # window will open for the few minutes the scan runs — let it be.
+    headless: false
+    # Pin to your installed Chrome major version if auto-detection fails.
+    version_main: null
+    # Explicit chromedriver binary. Normally leave null: on Apple Silicon a
+    # matching mac-arm64 driver is auto-downloaded (undetected-chromedriver
+    # only knows how to fetch x64 builds); elsewhere UC downloads its own.
+    driver_path: null
+
+sources:
+  rea:
+    enabled: true
+    entry_url: https://www.realestate.com.au/auction-results/vic
+    suburb_url_template: https://www.realestate.com.au/auction-results/{slug}
+    # The page embeds its application state as JSON in an inline script:
+    #   window.ArgonautExchange = {"resi-property_sales-events-web": {...}}
+    # We parse that payload, never the DOM. These paths locate the data.
+    state_script_regex: 'window\.ArgonautExchange\s*=\s*(\{.*?\});?\s*</script>'
+    exchange_key: resi-property_sales-events-web
+    entry_state_field: state       # entry page: {"state": "<json string>"}
+    suburb_state_field: location   # suburb page: {"location": "<json string>"}
+    paths:
+      # Entry page: list of suburbs that have results this week.
+      entry_suburbs: body.data.suburbResults
+      entry_week_ending: body.endDate
+      suburb_slug: suburb.urlValue
+      suburb_name: suburb.name
+      suburb_postcode: suburb.postcode
+      # Suburb page: one row per auction result.
+      results: body.data.auctionResults
+      page_suburb_name: body.data.suburb.name
+      page_suburb_postcode: body.data.suburb.postcode
+      week_ending: body.endDate
+      row:
+        event_id: eventId
+        event_type: eventType            # AUCTION_SALE / AUCTION_NO_SALE
+        outcome: outcome.value
+        outcome_display: outcome.display
+        price_display: price.display     # absent on non-sales
+        max_bid_display: auctionMaxBid.display   # e.g. "Last bid $690,000"
+        address: listing.address
+        bedrooms: listing.numBedrooms
+        property_type: listing.propertyType.display
+        land_size_value: listing.size.display
+        land_size_unit: listing.size.unit        # SQUARE_METRES seen
+        agency: listing.listingCompany.name
+        agents: listing.listers                  # [{id, name, ...}]
+        agent_name: name                         # within each lister
+        image: listing.mainImage.templatedUrl   # contains a {size} placeholder
+        listing_url: listing.trackedCanonical.templatedUrl
+        # canonicalLink is sometimes wrong on REA (points at other states);
+        # used only as a fallback and sanity-checked against the suburb.
+        listing_url_fallback: listing.canonicalLink
+
+  domain:
+    # Deferred for now (REA-first). Schema notes captured 2026-08-12:
+    # __NEXT_DATA__ -> props.pageProps.componentProps.salesListings[] each
+    # {suburb, listings: [{unitNumber, streetNumber, streetName, streetType,
+    #   suburb, postcode, propertyType, bedrooms, bathrooms, carspaces,
+    #   result, agencyName, domainPropertyDetailsUrl, ...}]}
+    enabled: false
+    entry_url: https://www.domain.com.au/auction-results/melbourne/
+
+# ----------------------------------------------------------------------------
+# Outcome label mapping — raw source labels to canonical outcomes.
+# Canonical set: SOLD, SOLD_PRIOR, SOLD_AFTER, PASSED_IN,
+#                PASSED_IN_VENDOR_BID, NO_BID, WITHDRAWN, POSTPONED,
+#                UNREPORTED, UNKNOWN
+# Any raw label not listed here is logged loudly and emitted as UNKNOWN —
+# never silently dropped.
+# ----------------------------------------------------------------------------
+outcome_mapping:
+  rea:
+    SOLD_AT_AUCTION: SOLD
+    SOLD_AUCTION_UNKNOWN: SOLD          # "Sold at auction", price sometimes withheld
+    SOLD_PRIOR_TO_AUCTION: SOLD_PRIOR
+    SOLD_AFTER_AUCTION: SOLD_AFTER
+    PASSED_IN: PASSED_IN
+    PASSED_IN_VENDOR_BID: PASSED_IN_VENDOR_BID
+    NO_BID: NO_BID                      # speculative — not yet observed live
+    WITHDRAWN: WITHDRAWN
+    AUCTION_WITHDRAWN: WITHDRAWN        # speculative
+    POSTPONED: POSTPONED                # speculative
+    AUCTION_POSTPONED: POSTPONED        # speculative
+    UNREPORTED: UNREPORTED              # speculative
+  domain:
+    AUSD: SOLD            # sold at auction
+    AUSP: SOLD_PRIOR      # sold prior
+    AUSA: SOLD_AFTER      # sold after
+    AUPI: PASSED_IN       # passed in
+    AUVB: PASSED_IN_VENDOR_BID   # passed in on vendor bid
+    AUWD: WITHDRAWN
+    AUPP: POSTPONED
+    AUNB: NO_BID          # speculative
+
+# Which canonical outcomes count as "still on the market" (leads).
+lead_outcomes:
+  - PASSED_IN
+  - PASSED_IN_VENDOR_BID
+  - NO_BID
+  - WITHDRAWN      # flagged in output — sometimes withdrawn-and-sold
+  - UNREPORTED     # flagged separately — often a quiet pass-in
+  - UNKNOWN        # unrecognised labels surface here, never dropped
+
+filters:
+  # Applied to the LOWER bound of a quoted range: vendors quote low, and the
+  # point is to catch anything that might land under budget.
+  price_ceiling: 1200000
+  # Optional second ceiling: results between price_ceiling and stretch_ceiling
+  # appear in a separate "stretch" section instead of being dropped.
+  # Set to null to disable.
+  stretch_ceiling: null
+
+  # Suburb selection. mode: list — only the suburbs below are fetched.
+  #                   mode: all  — fetch every suburb with results (slow: 500+
+  #                   pages at the configured delays; expect ~40 min).
+  suburbs_mode: list
+  suburbs:
+    # Names as they appear on the source sites.
+    - Windsor
+    - Richmond
+    - South Melbourne
+    - Prahran
+    - Port Melbourne
+    - Balaclava
+    - Elwood
+
+  min_bedrooms: 2
+  # Property types to INCLUDE. Empty list = all types. REA labels observed:
+  # House, Townhouse, Unit, Apartment, Villa, Land. Rows with an unknown/
+  # missing type are always included rather than silently dropped.
+  property_types:
+    - House
+  # Property types to exclude entirely (applied after the include list).
+  exclude_property_types: []
+  # Null land size means "unknown", and unknown must be INCLUDED — most
+  # auction-result rows carry no land size. Set a number to filter known sizes.
+  min_land_size_sqm: null
+  exclude_agencies: []
+  # Substring match against the street part of the address, case-insensitive.
+  # For known main roads / train lines, e.g. ["Bell St", "Sydney Rd"].
+  exclude_streets: []
+
+# ----------------------------------------------------------------------------
+# Price enrichment (§6): resolve a price signal for each non-sale by fetching
+# its listing page. Order of preference is fixed in code (quoted range, then
+# highest/vendor bid, then relisted price, then SOI, else UNKNOWN); these
+# settings control how much fetching a run may do and how prices are located
+# in listing HTML.
+# ----------------------------------------------------------------------------
+enrich:
+  enabled: true
+  # Hard cap on listing pages fetched per run, applied after filtering, best
+  # leads first. Keeps run time inside the 15-minute budget.
+  max_pages_per_run: 40
+  # Regexes tried in order against the raw listing HTML; first money-like
+  # match wins. Group 1 must capture the price text.
+  price_patterns:
+    - '"marketingPriceRange"\s*:\s*"([^"]+)"'
+    - '"priceText"\s*:\s*"([^"]+)"'
+    - '"price"\s*:\s*\{\s*"display"\s*:\s*"([^"]+)"'
+    - '<span[^>]*property-price[^>]*>([^<]+)</span>'
+    - '"displayPrice"\s*:\s*"([^"]+)"'
+
+# ----------------------------------------------------------------------------
+# Campaign dating (time on market)
+#
+# Both portals compute days-on-market from the CURRENT listing record only,
+# so withdrawing and relisting resets the counter to zero — a deliberate
+# tactic, and Australia has no MLS holding a cumulative figure. So the start
+# date is reconstructed from several sources and the earliest defensible one
+# wins. See docs/dating-a-campaign.md.
+# ----------------------------------------------------------------------------
+dating:
+  enabled: true
+  # Melbourne auction campaigns run about four weeks of advertising. This is
+  # an assumption: a longer campaign makes the inferred start late, so
+  # auction-inferred figures understate rather than overstate. Read those as
+  # "at least N days".
+  auction_campaign_days: 28
+  # archive.org needs no page load and nothing for a bot detector to see, so
+  # it is always tried first.
+  use_archive: true
+  archive_timeout_seconds: 30
+  # REA rehosts the Statement of Information under a content-hash filename,
+  # discarding the agency's timestamped one — so read the publication time
+  # from the CDN's Last-Modified header instead (a free HEAD request).
+  use_soi_headers: true
+  # Only consulted when the archive comes back empty — this one costs a
+  # paid fetch.
+  use_listing_page: true
+  # The listing page states no date, but the *agent's* profile page stamps
+  # every property they have on market with "Listed 28 Jul 2026". It is
+  # server-rendered in full — the Sold/For sale dropdown and the "see more"
+  # button reveal data that is already in the HTML — so one fetch dates that
+  # agent's whole roster, and the disk cache makes every later property on
+  # the same agent free for the rest of the day. Cheapest date we have.
+  #
+  # It is REA's own record, so a relist resets it; a reset only moves the
+  # date later, so it stays a lower bound. Being REA's claim is also what
+  # makes clock-reset detection work on REA at all (previously Domain-only).
+  use_agent_page: true
+  # Listings name a lead agent and often a second. Only the lead usually
+  # carries the property, so stop after this many profile fetches.
+  max_agent_pages_per_listing: 2
+  # Flag a reset when the portal's counter is at least this far behind the
+  # documentary evidence. Wide enough that ordinary reporting lag doesn't
+  # trip it.
+  clock_reset_threshold_days: 21
+  # "Long on market" view: currently listed and advertised for longer than
+  # this, auction or not.
+  stale_after_days: 60
+  # Cap on dating lookups per run, so a big first run can't blow the budget.
+  max_lookups_per_run: 40
+
+# ----------------------------------------------------------------------------
+# Past-auction detection (§ docs/two-date-auction-detection.md)
+#
+# For a property currently for sale, work out whether it has ALREADY been to
+# auction and failed. No portal states this, so it is established by
+# narrowing the auction to one or two Saturdays and checking actual result
+# records. An address absent from those records is never reported as "no
+# auction" — agents frequently don't report failures.
+# ----------------------------------------------------------------------------
+auction_check:
+  enabled: true
+  # Melbourne campaigns run 3-5 weeks of advertising and finish on a
+  # Saturday; 4 is the base case. Each extra week is one more page to check.
+  campaign_weeks: [3, 4, 5]
+  # Domain keeps ~6 months of dated result pages and is the only public
+  # record naming a failed auction. One fetch per Saturday, cached forever
+  # and shared by every property that auctioned that day.
+  use_domain_archive: true
+  domain_city: melbourne
+  # Staleness is judged against how long things normally take to sell, not
+  # an absolute day count: staleRatio = days advertised ÷ this benchmark,
+  # flagged above stale_ratio. ASSUMPTION — a real per-suburb median would
+  # come from property.com.au, which isn't wired in; 30 days is a typical
+  # Melbourne figure. Tune per your suburbs.
+  suburb_median_days: 30
+  stale_ratio: 1.5
+  # Cap on Domain week-fetches per request, so one add can't spend a lot.
+  max_weeks_per_check: 3
+
+# ----------------------------------------------------------------------------
+# Domain property profiles — filling REA's two gaps
+#
+#   land size:  REA only publishes it when the agent supplied one
+#   listing date: REA publishes none at all, and a Statement of Information
+#                 re-issued on relist dates the NEW campaign, hiding the
+#                 original. Domain's listing record carries a real
+#                 dateListed that survives a REA relist.
+#
+# Verified 2026-08-13 on 13 Fern Avenue: land 203m² (matching REA) and
+# dateListed 2026-06-17 — the same date an independent property.com.au
+# reading gave. property.com.au itself is not usable here: its URLs need a
+# PropTrack property ID that REA's payload doesn't contain.
+#
+# Costs up to two premium fetches per property, so both are gated below.
+# ----------------------------------------------------------------------------
+domain_profile:
+  enabled: true
+  state: vic
+  # Fetch the profile when REA gave no land size.
+  for_land_size: true
+  # Fetch the listing when the campaign date still rests on something
+  # resettable or inferred.
+  for_dates: true
+  # agent-listed belongs here despite being documented: it is REA's own
+  # record, so a REA relist resets it, and Domain's dateListed is exactly the
+  # independent date that sees past such a relist.
+  weak_bases: [current-listing, observed-floor, soi-document, soi-median-period, agent-listed]
+  # Domain's suburb boundaries differ from REA's — the same 3181 address is
+  # Windsor to Domain's profile and Prahran to its listing — so slugs are
+  # tried in turn. Add aliases as you hit them (keys are normalised names).
+  max_slug_tries: 3
+  suburb_aliases:
+    prahran: [Windsor]
+    windsor: [Prahran]
+    south yarra: [Prahran]
+
+ranking:
+  # Score = sum of applicable weights; list is sorted descending.
+  # Tweak here, not in code.
+  weights:
+    per_week_unsold: 100        # weeks_unsold * this
+    outcome:
+      NO_BID: 60                # strongest signal of a soft listing
+      PASSED_IN_VENDOR_BID: 50  # nobody real bid
+      PASSED_IN: 40
+      UNREPORTED: 20
+      WITHDRAWN: 15
+      UNKNOWN: 10
+    has_price: 25               # priced results rank above UNKNOWN-priced
+    has_bid_figure: 10          # a published bid bounds the reserve
+  # Within equal scores, cheaper first.
+  tiebreak: price_ascending
+
+# ----------------------------------------------------------------------------
+# Parse canary (§11): asserts expected structure every run and fails loudly
+# on drift. Selector rot fails in the direction of "no properties found",
+# which looks identical to a quiet week — these thresholds catch that.
+# ----------------------------------------------------------------------------
+canary:
+  min_entry_suburbs: 100          # entry page should index 100+ suburbs
+  min_suburb_parse_rate: 0.8      # >=80% of fetched suburb pages must parse
+  # Alert if this week's non-sale count drops below this fraction of the
+  # trailing 4-week average (checked against run history in SQLite).
+  min_weekly_ratio: 0.3

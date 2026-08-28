@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Passed-In Property Tracker",
+  "version": "1.4",
+  "description": "Save the property listing you're viewing into your passed-in-finder tracker, local or hosted.",
+  "action": {
+    "default_title": "Track this property"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "https://*.fly.dev/*"
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}

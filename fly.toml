@@ -1,0 +1,33 @@
+# Fly.io deployment for the passed-in finder.
+#
+# One always-on machine in Sydney with a persistent volume. It is deliberately
+# NOT set to auto-stop: a scan runs as a background subprocess with no open
+# HTTP connection, so an idle-based suspend would kill a run mid-flight and
+# waste the scrape.do credits it had already spent.
+
+app = "passedin-reece"
+primary_region = "syd"
+
+[build]
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  PASSEDIN_CONFIG = "/data/config.yaml"
+  TZ = "Australia/Melbourne"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+# SQLite store, page cache, logs, and the config the settings panel writes to.
+[mounts]
+  source = "passedin_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

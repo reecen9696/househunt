@@ -1,0 +1,26 @@
+<meta charset="utf-8">
+<title>Passed-In Tracker settings</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; max-width: 30rem; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { width: 100%; padding: 6px 8px; font: inherit; box-sizing: border-box; }
+  p.hint { color: #666; margin: 4px 0 0; font-size: 13px; }
+  button { margin-top: 18px; padding: 7px 16px; font: inherit; }
+  #status { margin-left: 10px; color: #2d6a4f; }
+</style>
+<h1>Server</h1>
+
+<label for="baseUrl">Address</label>
+<input id="baseUrl" type="text" placeholder="https://passedin-reece.fly.dev">
+<p class="hint">The hosted server, or <code>http://127.0.0.1:8765</code> for a local <code>passedin serve</code>.</p>
+
+<label for="user">Username</label>
+<input id="user" type="text">
+
+<label for="password">Password</label>
+<input id="password" type="password">
+<p class="hint">Leave blank for a local server with no password set.</p>
+
+<button id="save">Save</button><span id="status"></span>
+
+<script src="options.js"></script>

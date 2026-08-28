@@ -1,0 +1,31 @@
+# The Sunday-morning ritual, triggered against the hosted server.
+#
+# Fly has no precise native cron, and the app already exposes the scan as an
+# endpoint the review page uses — so this just presses the same button.
+name: Weekly scan
+
+on:
+  schedule:
+    # 22:00 UTC Saturday = 8am Sunday AEST (9am during AEDT). Saturday's
+    # auction results are reported by then.
+    - cron: "0 22 * * 6"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger scan
+        env:
+          URL: ${{ secrets.PASSEDIN_URL }}
+          USER: ${{ secrets.PASSEDIN_USER }}
+          PASSWORD: ${{ secrets.PASSEDIN_PASSWORD }}
+        run: |
+          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
+            -X POST -u "$USER:$PASSWORD" "$URL/api/scan")
+          cat /tmp/out.json; echo
+          # 409 means a scan was already running — not a failure.
+          if [ "$code" != "200" ] && [ "$code" != "409" ]; then
+            echo "Scan trigger failed with HTTP $code" >&2
+            exit 1
+          fi
