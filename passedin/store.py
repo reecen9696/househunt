@@ -152,6 +152,51 @@ CREATE TABLE IF NOT EXISTS domain_profiles (
     looked_up_at    TEXT NOT NULL
 );
 
+-- Scheduled open-for-inspection times, one row per listing per slot.
+-- Replaced wholesale on each refresh rather than merged: an agent who
+-- cancels a Saturday open removes it from the listing, and a merge would
+-- keep sending you to a house with nobody there.
+CREATE TABLE IF NOT EXISTS inspections (
+    url         TEXT NOT NULL,
+    start_time  TEXT NOT NULL,   -- ISO8601 *with* offset, verbatim from REA
+    end_time    TEXT,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (url, start_time)
+);
+
+-- Listings checked for inspection times, including the ones that had none.
+-- Without this an agent-scheduled-nothing listing is indistinguishable from
+-- one we never looked at, and the tab would re-fetch it every click.
+CREATE TABLE IF NOT EXISTS inspection_checks (
+    url        TEXT PRIMARY KEY,
+    checked_at TEXT NOT NULL,
+    found      INTEGER NOT NULL DEFAULT 0,
+    error      TEXT
+);
+
+-- Google-billed travel times, cached so re-planning the same Saturday costs
+-- nothing. Keyed by rounded coordinates plus the weekday+hour the trip
+-- starts, because a traffic-aware time is only valid for the slot it was
+-- asked about.
+CREATE TABLE IF NOT EXISTS travel_times (
+    cache_key  TEXT PRIMARY KEY,
+    seconds    INTEGER,
+    metres     INTEGER,
+    provider   TEXT,
+    fetched_at TEXT NOT NULL
+);
+
+-- Geocoded free-text start addresses ("home"). A place's coordinates don't
+-- change, so this is one paid lookup per address ever.
+CREATE TABLE IF NOT EXISTS geocodes (
+    query      TEXT PRIMARY KEY,
+    latitude   REAL,
+    longitude  REAL,
+    display    TEXT,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspections_start ON inspections(start_time);
 CREATE INDEX IF NOT EXISTS idx_domain_rows_addr
     ON domain_auction_rows(address_norm, postcode);
 CREATE INDEX IF NOT EXISTS idx_snapshots_week ON snapshots(week_ending);
@@ -175,6 +220,11 @@ class Store:
             ("tracked_properties", "auction_date", "TEXT"),
             ("tracked_properties", "sale_method", "TEXT"),
             ("tracked_properties", "agent_profile_url", "TEXT"),
+            # REA geocodes every listing in its own payload, so the map pin
+            # comes free with the page we already fetch — no geocoding call
+            # per property before a route can be planned.
+            ("tracked_properties", "latitude", "REAL"),
+            ("tracked_properties", "longitude", "REAL"),
         ):
             cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in cols:
@@ -330,7 +380,8 @@ class Store:
                        "price_low", "price_high", "date_listed", "land_size_sqm",
                        "image_url", "floorplan_url", "agency_name", "agent_name",
                        "agency_color", "inspection_text", "auction_text",
-                       "auction_date", "sale_method", "agent_profile_url")
+                       "auction_date", "sale_method", "agent_profile_url",
+                       "latitude", "longitude")
 
     def upsert_tracked(self, data: dict) -> int:
         """Add or refresh a tracked property by URL. Listing facts are
@@ -383,6 +434,106 @@ class Store:
     def remove_tracked(self, tracked_id: int) -> None:
         self.conn.execute("DELETE FROM tracked_properties WHERE tracked_id=?",
                           (tracked_id,))
+        self.conn.commit()
+
+    # --- inspections ----------------------------------------------------------
+
+    def replace_inspections(self, url: str, slots: list[dict],
+                            error: Optional[str] = None) -> int:
+        """Set a listing's inspection times to exactly `slots`.
+
+        Wholesale replacement, because a cancelled open disappears from the
+        listing and merging would leave you driving to it. A failed fetch
+        passes `error` and leaves the previous times alone — stale times beat
+        no times, as long as the page says which they are.
+        """
+        url = (url or "").split("?")[0].strip()
+        if not url:
+            raise ValueError("inspections need a url")
+        now = date.today().isoformat()
+        cur = self.conn.cursor()
+        if error is None:
+            cur.execute("DELETE FROM inspections WHERE url=?", (url,))
+            for slot in slots:
+                cur.execute(
+                    """INSERT OR REPLACE INTO inspections
+                       (url, start_time, end_time, fetched_at) VALUES (?,?,?,?)""",
+                    (url, slot["start_time"], slot.get("end_time"), now))
+        cur.execute(
+            """INSERT OR REPLACE INTO inspection_checks
+               (url, checked_at, found, error) VALUES (?,?,?,?)""",
+            (url, now, len(slots), error))
+        self.conn.commit()
+        return len(slots)
+
+    def list_inspections(self) -> list[sqlite3.Row]:
+        """Every stored inspection joined to the property it belongs to.
+
+        Inner join on tracked_properties: removing a property from the tracker
+        should take its inspections out of the planner too.
+        """
+        return self.conn.execute(
+            """SELECT i.url, i.start_time, i.end_time, i.fetched_at,
+                      t.tracked_id, t.address, t.suburb, t.postcode,
+                      t.latitude, t.longitude, t.price_text, t.bedrooms,
+                      t.bathrooms, t.car_spaces, t.image_url, t.agency_name,
+                      t.agent_name, t.agency_color, t.auction_text,
+                      t.auction_date, t.status
+               FROM inspections i
+               JOIN tracked_properties t ON t.url = i.url
+               ORDER BY i.start_time"""
+        ).fetchall()
+
+    def inspection_checks(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT c.*, t.address FROM inspection_checks c
+               JOIN tracked_properties t ON t.url = c.url"""
+        ).fetchall()
+
+    # --- travel-time cache ----------------------------------------------------
+
+    def get_travel_times(self, keys: Iterable[str],
+                         max_age_days: int) -> dict[str, sqlite3.Row]:
+        keys = list(keys)
+        if not keys:
+            return {}
+        out = {}
+        # Chunked: SQLite's default host-parameter limit is 999.
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            rows = self.conn.execute(
+                f"""SELECT * FROM travel_times
+                    WHERE cache_key IN ({','.join('?' * len(chunk))})
+                      AND julianday('now') - julianday(fetched_at) <= ?""",
+                (*chunk, max_age_days)).fetchall()
+            out.update({r["cache_key"]: r for r in rows})
+        return out
+
+    def save_travel_times(self, entries: Iterable[tuple]) -> None:
+        """entries: (cache_key, seconds, metres, provider)."""
+        now = date.today().isoformat()
+        self.conn.executemany(
+            """INSERT OR REPLACE INTO travel_times
+               (cache_key, seconds, metres, provider, fetched_at)
+               VALUES (?,?,?,?,?)""",
+            [(k, sec, m, prov, now) for k, sec, m, prov in entries])
+        self.conn.commit()
+
+    # --- geocode cache --------------------------------------------------------
+
+    def get_geocode(self, query: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM geocodes WHERE query=?", (query.strip().lower(),)
+        ).fetchone()
+
+    def save_geocode(self, query: str, latitude: Optional[float],
+                     longitude: Optional[float], display: Optional[str]) -> None:
+        self.conn.execute(
+            """INSERT OR REPLACE INTO geocodes
+               (query, latitude, longitude, display, fetched_at)
+               VALUES (?,?,?,?,?)""",
+            (query.strip().lower(), latitude, longitude, display,
+             date.today().isoformat()))
         self.conn.commit()
 
     def earliest_auction_week(self, address_norm: str,

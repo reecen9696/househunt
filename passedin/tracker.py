@@ -55,6 +55,13 @@ _PATTERNS: dict[str, list[str]] = {
         r'"propertySizes"\s*:\s*\{[^[\]]{0,160}?"land"\s*:\s*\{"displayValue"\s*:\s*"([\d,.]+)"',
         r'"landSize"\s*:\s*\{[^{}]*?"displayValue"\s*:\s*"?([\d,.]+)',
     ],
+    # The map pin, as REA geocoded it:
+    #   "display":{"fullAddress":"...","geocode":{"latitude":-37.8,"longitude":145.0}}
+    # It sits inside the address block the anchor points at, so anchoring
+    # keeps it away from an agency office or a related listing. This is what
+    # makes route planning possible without a geocoding call per property.
+    "latitude": [r'"geocode"\s*:\s*\{\s*"latitude"\s*:\s*(-?\d+\.?\d*)'],
+    "longitude": [r'"geocode"\s*:\s*\{[^{}]{0,80}?"longitude"\s*:\s*(-?\d+\.?\d*)'],
     # REA listing pages carry no listing/published date (publishedDate is
     # null), so time-on-market falls back to the date the property was added
     # to the tracker. These stay in case another source exposes one.
@@ -100,6 +107,7 @@ _PATTERNS: dict[str, list[str]] = {
 }
 
 _INTS = {"bedrooms", "bathrooms", "car_spaces"}
+_FLOATS = {"latitude", "longitude"}
 
 
 _TITLE_PATTERNS = (
@@ -151,6 +159,65 @@ _ANCHOR_WINDOW = 7500
 # shorter ones. Verified across 27 cached listing pages: `"auction":` appears
 # exactly once, or not at all, so there is no neighbouring value to inherit.
 _PAGE_LEVEL_JSON = {"auction_text", "auction_datetime"}
+
+
+def _json_array_span(view: str, open_bracket: int) -> str:
+    """The `[...]` slice starting at `open_bracket`, bracket-matched.
+
+    A bounded window won't do here: the listing's own `payload` block repeats
+    every inspection *and* the auction start alongside them, so a regex that
+    scans past the array's closing bracket picks up the auction as if it were
+    an inspection. Depth counting stops exactly at the end of the array.
+    """
+    depth = 0
+    in_string = False
+    for i in range(open_bracket, len(view)):
+        c = view[i]
+        if in_string:
+            # Escapes are already stripped from this view, so a quote always
+            # opens or closes a string.
+            if c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return view[open_bracket:i + 1]
+    return ""
+
+
+# Inside the array each entry is
+#   {"display":{...},"startTime":"2026-08-29T10:00:00+10:00",
+#    "endTime":"2026-08-29T10:30:00+10:00"}
+_INSPECTION_TIMES = re.compile(
+    r'"startTime"\s*:\s*"([^"]+)"\s*,\s*"endTime"\s*:\s*"([^"]+)"')
+
+
+def parse_inspections(html: str) -> list[dict]:
+    """Every scheduled open-for-inspection on a listing page, in time order.
+
+    REA embeds the list twice — once as `Inspection` and once as
+    `PersonalisedInspection` for its planner — with identical times, so the
+    two are merged and de-duplicated on (start, end). Both carry timezone
+    offsets, which are kept verbatim: Melbourne switches to daylight saving
+    in October and a naive local time would silently shift an itinerary by an
+    hour.
+
+    Returns [{"start_time": iso, "end_time": iso}], empty when the agent has
+    scheduled none (REA writes `"inspections":[]`, a positive statement that
+    there is nothing to attend rather than a parse failure).
+    """
+    view = re.sub(r"\\+u002F", "/", html).replace("\\", "")
+    seen: dict[tuple[str, str], dict] = {}
+    for m in re.finditer(r'"inspections"\s*:\s*(\[)', view):
+        for start, end in _INSPECTION_TIMES.findall(
+                _json_array_span(view, m.start(1))):
+            seen.setdefault((start, end), {"start_time": start, "end_time": end})
+    return sorted(seen.values(), key=lambda i: i["start_time"])
 
 
 def _anchored(pattern: str, view: str, anchor: int | None):
@@ -241,6 +308,11 @@ def parse_listing(html: str, url: str) -> dict:
     for f in _INTS & data.keys():
         try:
             data[f] = int(data[f])
+        except (TypeError, ValueError):
+            data.pop(f, None)
+    for f in _FLOATS & data.keys():
+        try:
+            data[f] = float(data[f])
         except (TypeError, ValueError):
             data.pop(f, None)
     if "land_size_sqm" in data:

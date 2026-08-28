@@ -53,8 +53,16 @@ class ScanRunner:
         if self.config_path is not None:
             cmd += ["--config", str(self.config_path)]
         cmd.append("scan")
+        # cwd is the config's own directory, which hosted is the data volume
+        # rather than the source tree — so where the package lives has to be
+        # stated explicitly or the subprocess cannot import it.
+        env = dict(os.environ)
+        pkg_root = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [p for p in (pkg_root, env.get("PYTHONPATH")) if p])
         self.proc = subprocess.Popen(
-            cmd, cwd=self.base_dir, stdout=log_file, stderr=subprocess.STDOUT,
+            cmd, cwd=self.base_dir, env=env,
+            stdout=log_file, stderr=subprocess.STDOUT,
         )
         logger.info("Scan started (pid %s), log: %s", self.proc.pid, self.log_path)
         return True

@@ -173,6 +173,18 @@ filters:
     - Port Melbourne
     - Balaclava
     - Elwood
+    - hawthorn
+    - hawthorn east
+    - caulfield
+    - caulfield north
+    - caulfield south
+    - malvern
+    - abbotsford
+    - camberwell
+    - kew
+    - windsor
+    - south melbourne
+    - albert park
 
   min_bedrooms: 2
   # Property types to INCLUDE. Empty list = all types. REA labels observed:
