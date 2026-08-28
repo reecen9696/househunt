@@ -11,6 +11,7 @@ so it regenerates report.html through the normal CLI path; the page polls
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 from datetime import date, datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -307,10 +309,80 @@ def _basic_auth_token() -> str | None:
     return base64.b64encode(f"{user}:{password}".encode()).decode()
 
 
+def _session_token(password: str) -> str:
+    """The cookie value that proves the password was entered.
+
+    Derived from the password rather than stored, so it survives a restart
+    without any session table, and changing PASSEDIN_PASSWORD invalidates
+    every existing cookie for free. Single-user: holding this token is
+    exactly equivalent to having known the password.
+    """
+    return hashlib.sha256(f"passedin-session:{password}".encode()).hexdigest()
+
+
+SESSION_COOKIE = "passedin_session"
+
+# Shown in place of the report when signed out. Deliberately not the browser's
+# Basic dialog: that cannot be styled, cannot be dismissed, and has no obvious
+# way back once you cancel it.
+_LOGIN_PAGE = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passed-In</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, -apple-system, sans-serif; margin: 0;
+         min-height: 100vh; display: grid; place-items: center;
+         background: #f6f6f4; color: #1a1a1a; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #17181a; color: #ececec; }
+    form { background: #212327 !important; border-color: #33363b !important; }
+    input { background: #17181a !important; color: #ececec !important;
+            border-color: #3a3d43 !important; }
+  }
+  form { background: #fff; border: 1px solid #e2e2dd; border-radius: 12px;
+         padding: 28px 26px; width: min(20rem, 90vw);
+         box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 18px; color: #6b6b6b; font-size: 13px; }
+  input { width: 100%; padding: 9px 11px; font: inherit; border-radius: 7px;
+          border: 1px solid #d5d5cf; box-sizing: border-box; }
+  button { width: 100%; margin-top: 12px; padding: 9px; font: inherit;
+           font-weight: 600; border: 0; border-radius: 7px;
+           background: #2d6a4f; color: #fff; cursor: pointer; }
+  button:hover { background: #245741; }
+  .err { color: #a3320b; font-size: 13px; margin-top: 10px; min-height: 1em; }
+</style>
+<form id="f">
+  <h1>Passed-In</h1>
+  <p class="sub">Enter the password to continue.</p>
+  <input id="pw" type="password" autocomplete="current-password" autofocus>
+  <button type="submit">Sign in</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+document.getElementById("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const err = document.getElementById("err");
+  err.textContent = "";
+  const resp = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: document.getElementById("pw").value }),
+  });
+  if (resp.ok) { location.reload(); }
+  else { err.textContent = "Wrong password."; document.getElementById("pw").select(); }
+});
+</script>
+"""
+
+
 def serve(report_path: Path, db_path: Path, base_dir: Path, log_dir: Path,
           port: int = 8765, config=None, host: str = "127.0.0.1") -> None:
     report_path = Path(report_path)
     auth_token = _basic_auth_token()
+    password = os.environ.get("PASSEDIN_PASSWORD")
+    session_token = _session_token(password) if password else None
     runner = ScanRunner(base_dir, log_dir,
                         config_path=getattr(config, "path", None))
     enricher = Enricher(db_path, config)
@@ -338,18 +410,44 @@ def serve(report_path: Path, db_path: Path, base_dir: Path, log_dir: Path,
                              "Content-Type, Authorization")
 
         def _authorised(self) -> bool:
+            """A session cookie from the login form, or Basic credentials.
+
+            Basic stays supported because the Chrome extension and the weekly
+            GitHub Actions cron authenticate that way; only the browser is
+            moved onto the cookie.
+            """
             if auth_token is None:
+                return True
+            cookie = self._cookie(SESSION_COOKIE)
+            if cookie and session_token and hmac.compare_digest(cookie, session_token):
                 return True
             header = self.headers.get("Authorization", "")
             if not header.startswith("Basic "):
                 return False
             return hmac.compare_digest(header[6:].strip(), auth_token)
 
+        def _cookie(self, name: str) -> str | None:
+            raw = self.headers.get("Cookie")
+            if not raw:
+                return None
+            return SimpleCookie(raw)[name].value if name in SimpleCookie(raw) else None
+
         def _challenge(self) -> None:
+            # No WWW-Authenticate: that header is what makes the browser throw
+            # up its own unstyled credentials dialog, which the login form
+            # replaces. Clients using Basic send it preemptively anyway.
             self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="passedin"')
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def _login_page(self) -> None:
+            body = _LOGIN_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
 
         def _body(self) -> dict:
             length = int(self.headers.get("Content-Length", 0))
@@ -387,6 +485,8 @@ def serve(report_path: Path, db_path: Path, base_dir: Path, log_dir: Path,
 
         def do_GET(self):
             if not self._authorised():
+                if self.route in ("/", "/index.html", "/report.html"):
+                    return self._login_page()
                 return self._challenge()
             if self.route in ("/", "/index.html", "/report.html"):
                 body = report_path.read_bytes()
@@ -409,7 +509,33 @@ def serve(report_path: Path, db_path: Path, base_dir: Path, log_dir: Path,
             else:
                 self.send_error(404)
 
+        def _login(self) -> None:
+            if session_token is None:
+                # No password configured: nothing to sign in to.
+                return self._json({"ok": True})
+            try:
+                supplied = str(self._body().get("password", ""))
+            except (ValueError, json.JSONDecodeError):
+                return self._json({"ok": False}, 400)
+            if not hmac.compare_digest(supplied, password or ""):
+                logger.warning("Failed sign-in from %s", self.address_string())
+                return self._json({"ok": False}, 401)
+            body = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            # Secure only over HTTPS, which behind Fly's proxy is what the
+            # forwarded-proto header reports rather than the socket itself.
+            https = self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            cookie = (f"{SESSION_COOKIE}={session_token}; Path=/; HttpOnly; "
+                      f"SameSite=Lax; Max-Age=31536000")
+            self.send_header("Set-Cookie", cookie + ("; Secure" if https else ""))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
+            if self.route == "/api/login":
+                return self._login()
             if not self._authorised():
                 return self._challenge()
             try:

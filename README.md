@@ -323,12 +323,25 @@ come from the image. `deploy/bootstrap.py` reconciles them on every boot —
 the image's file wins, then the saved criteria are re-applied on top through
 the same whitelisted, comment-preserving writer the panel uses.
 
-**Auth** is HTTP Basic, and it switches on only when `PASSEDIN_PASSWORD` is
-set. A local `passedin serve` leaves it unset and behaves exactly as before;
-hosted, it keeps `/api/scan` — which spends scrape.do credits — and the
-tracker private. It is a single shared login, not per-user accounts: the
-tables still have no user scope, so this is a lock on the front door rather
-than multi-tenancy.
+**Auth** switches on only when `PASSEDIN_PASSWORD` is set. A local
+`passedin serve` leaves it unset and behaves exactly as before; hosted, it
+keeps `/api/scan` — which spends scrape.do credits — and the tracker private.
+
+In the browser it is a login form: signing in POSTs to `/api/login` and gets
+back an `HttpOnly` session cookie, so the report page is only served once you
+are signed in. The cookie value is derived from the password rather than
+stored, which means it survives a restart with no session table and changing
+`PASSEDIN_PASSWORD` invalidates every existing cookie for free.
+
+HTTP Basic is still accepted on every endpoint, because the Chrome extension
+and the weekly cron authenticate that way; only the browser was moved onto
+the cookie. The 401s deliberately carry no `WWW-Authenticate` header — that
+header is what makes the browser raise its own unstyled dialog.
+
+It is a single shared login, not per-user accounts: the tables still have no
+user scope, so this is a lock on the front door rather than multi-tenancy.
+The password is only as good as the word you choose — `/api/scan` spends real
+money, so a guessable one is a real cost, not just a privacy question.
 
 **The machine is deliberately not set to auto-stop.** A scan runs as a
 background subprocess with no open HTTP connection, so an idle-based suspend
