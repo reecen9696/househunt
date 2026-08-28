@@ -16,6 +16,9 @@ python -m passedin scan     # Sunday morning. Fetch → parse → store → repo
 python -m passedin serve    # open the review page; dismiss / rate / note
 ```
 
+Or don't run it at all: the hosted deployment does the scan on a schedule and
+keeps the review page up. See [Hosted deployment](#hosted-deployment).
+
 Optionally run `scan` again Tuesday to catch late-reported results and
 "sold after auction" corrections — runs are idempotent per results-week.
 
@@ -298,22 +301,67 @@ Two things to know:
   (`current-listing`, `observed-floor`, or an SOI that a relist would have
   re-issued). A property with a hard auction anchor is skipped entirely.
 
-## Hosting later
+## Hosted deployment
 
-The tool is local-first but nothing blocks a hosted deployment:
+Live at **https://passedin-reece.fly.dev** — one always-on Fly.io machine in
+Sydney, so the weekly scan and the tracker no longer need a laptop running.
+Log in with the username and password held in the app's Fly secrets.
+
+```bash
+fly deploy                       # ship a change
+fly logs --app passedin-reece    # watch a scan
+fly ssh console --app passedin-reece
+```
+
+**State** lives on a 3 GB volume mounted at `/data`: the SQLite store, the
+page cache, logs, and the live `config.yaml`. Nothing is in the image.
+
+**Config has two halves that need opposite homes.** The search criteria are
+written back by the settings panel, so they must survive a redeploy; the
+scrape selectors are the thing you edit when a source breaks, so they must
+come from the image. `deploy/bootstrap.py` reconciles them on every boot —
+the image's file wins, then the saved criteria are re-applied on top through
+the same whitelisted, comment-preserving writer the panel uses.
+
+**Auth** is HTTP Basic, and it switches on only when `PASSEDIN_PASSWORD` is
+set. A local `passedin serve` leaves it unset and behaves exactly as before;
+hosted, it keeps `/api/scan` — which spends scrape.do credits — and the
+tracker private. It is a single shared login, not per-user accounts: the
+tables still have no user scope, so this is a lock on the front door rather
+than multi-tenancy.
+
+**The machine is deliberately not set to auto-stop.** A scan runs as a
+background subprocess with no open HTTP connection, so an idle-based suspend
+would kill a run mid-flight and waste the credits it had already spent.
+
+**The weekly scan** is a GitHub Actions cron (`.github/workflows/weekly-scan.yml`)
+that POSTs to `/api/scan` — Fly has no precise scheduler, and the endpoint
+the review page already uses is the same button. It fires 22:00 UTC Saturday,
+which is 8am Sunday AEST and 9am AEDT. Repo secrets `PASSEDIN_URL`,
+`PASSEDIN_USER` and `PASSEDIN_PASSWORD` drive it; `workflow_dispatch` runs it
+by hand. A 409 (scan already running) is treated as success, not failure.
+
+**The image** installs `requirements-deploy.txt`, not `requirements.txt`:
+`build_fetcher` imports each fetcher lazily and the deployment runs
+`fetch.fetcher: scrapedo`, so selenium and undetected-chromedriver are never
+imported and are left out — 39 MB instead of several hundred. Switching the
+hosted config to `chrome` would need them back, plus a browser in the image.
+
+**The extension** stores its server address and password in
+`chrome.storage.sync`, set on its options page, so the same build works
+against localhost and against the hosted origin.
+
+### Still local-only if you scale it up
 
 - **Storage** is entirely behind `store.py` (one class, plain SQL). Moving to
   Postgres means swapping that class's connection and the few SQLite-specific
   bits (`INSERT OR REPLACE`, `AUTOINCREMENT`); no other module touches the DB.
   Schema changes are applied by the idempotent migration loop in `Store.__init__`.
-- **API** is already HTTP+JSON (`/api/track`, `/api/tracked`,
-  `/api/tracked/update`, `/api/tracked/remove`, `/api/user`, `/api/scan`), so
-  the front end and extension talk to a URL, not to Python.
-- **Before exposing it publicly** you'd need: auth (there is none — it binds
-  to 127.0.0.1 and assumes a single trusted user), a per-user scope on every
-  table, tighter CORS than the current `*`, and the scan moved to a job queue
-  instead of a subprocess. The extension's `host_permissions` and the API
-  constant in `background.js` would point at the hosted origin.
+- **More than one user** would need a per-user scope on every table, real
+  accounts instead of the shared Basic login, and tighter CORS than the
+  current `*`.
+- **The scan is a subprocess**, one at a time per machine. Concurrent users or
+  multiple machines would want a job queue.
 
 ## Extending
 
